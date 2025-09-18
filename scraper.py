@@ -41,12 +41,28 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
+# Build default request headers.  We support overriding the
+# User‑Agent via an environment variable (KLEINANZEIGEN_UA).  When
+# provided, that value will replace the default browser signature.  A
+# cookie header can also be provided via KLEINANZEIGEN_COOKIE.  See
+# the ``__init__`` method for how these values are applied to the
+# session used for all requests.
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    )
+    "User-Agent": os.getenv(
+        "KLEINANZEIGEN_UA",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    ),
+    # Accept & language headers mimic a real browser.  These help avoid
+    # 403 responses when Kleinanzeigen performs bot detection.  They can
+    # be overridden by the caller if necessary by updating the session.
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 
@@ -112,13 +128,46 @@ class KleinanzeigenScraper:
             likelihood of being blocked.  Set to zero to disable.
         """
         self.delay = delay
+        # Use a session so that cookies and headers persist across
+        # requests.  This improves performance and allows us to send
+        # authentication/consent cookies to Kleinanzeigen.  If the user
+        # defines KLEINANZEIGEN_COOKIE (copied from their browser), it
+        # will be attached to every request.
+        self.session = requests.Session()
+        # Apply default headers to the session.  Individual calls may
+        # override or extend these via the headers argument on
+        # ``session.get``.
+        self.session.headers.update(HEADERS)
+        # If the user provides a cookie string via environment variable,
+        # attach it.  Kleinanzeigen uses this cookie to determine
+        # consent and personalise results.  Without it many requests
+        # return a 403 or show a consent page.
+        cookie = os.getenv("KLEINANZEIGEN_COOKIE")
+        if cookie:
+            self.session.headers["Cookie"] = cookie
+        # Perform a warm‑up request to establish any additional session
+        # cookies (e.g. load balancer cookies).  We ignore failures
+        # here; they will be surfaced on subsequent real requests.
+        try:
+            self.session.get("https://www.kleinanzeigen.de", timeout=20, allow_redirects=True)
+        except requests.RequestException:
+            pass
 
-    def _fetch(self, url: str) -> str:
+    def _fetch(self, url: str, referer: Optional[str] = None) -> str:
         """Fetch the given URL and return its text content.
 
-        Raises a RuntimeError if the request fails.
+        A ``Referer`` header can be provided to better mimic browser
+        navigation.  Any session‑wide cookies and headers are
+        automatically included.  Raises a RuntimeError if the request
+        fails.
         """
-        resp = requests.get(url, headers=HEADERS)
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        try:
+            resp = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
         if not resp.ok:
             raise RuntimeError(f"Failed to fetch {url}: {resp.status_code}")
         # optional delay to respect rate limits
@@ -129,45 +178,108 @@ class KleinanzeigenScraper:
     def scrape_seller(self, seller_url: str) -> List[str]:
         """Return a list of all listing URLs for a given seller.
 
-        This method follows pagination links automatically.  Duplicate
-        URLs are removed while preserving order.
+        The ``seller_url`` can be either a seller profile (``/pro/...``)
+        or a pre‑constructed inventory URL (``/s-bestandsliste.html?userId=...``).
+        This method attempts to collect all ad URLs from the given
+        page.  If the page does not contain any ad items or appears to
+        show only a subset, it will try to derive the seller's
+        ``userId`` and load the full inventory list.  Duplicate URLs
+        are removed while preserving order.
         """
-        ad_urls: List[str] = []
         seen: set[str] = set()
-        next_url: Optional[str] = seller_url
-        base = "https://www.kleinanzeigen.de"
+        ad_urls: List[str] = []
 
-        while next_url:
-            html = self._fetch(next_url)
+        def collect_from_html(html: str, base_url: str) -> None:
+            """Internal helper to collect ad URLs from a piece of HTML.
+
+            It populates ``ad_urls`` and ``seen`` in the enclosing scope.
+            """
             soup = BeautifulSoup(html, "html.parser")
-            # find all articles with data-href
+            # Primary: <article data-href="..."> elements
             for article in soup.find_all("article", attrs={"data-href": True}):
                 rel = article.get("data-href")
                 if not rel:
                     continue
-                full_url = urljoin(base, rel)
-                if full_url not in seen:
-                    seen.add(full_url)
-                    ad_urls.append(full_url)
+                full = urljoin(base_url, rel)
+                if full not in seen:
+                    seen.add(full)
+                    ad_urls.append(full)
+            # Fallback: <a href="/s-anzeige/..."> links outside of articles
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("/s-anzeige/"):
+                    full = urljoin(base_url, href)
+                    if full not in seen:
+                        seen.add(full)
+                        ad_urls.append(full)
+            return
 
-            # locate the next page link via rel="next" first
-            link = soup.find("a", attrs={"rel": "next"})
-            # fallback: look for pagination control labelled 'Weiter' or 'nächste'
-            if not link:
-                for a in soup.find_all("a"):
-                    label = (a.get("aria-label") or a.get_text() or "").lower()
-                    if "weiter" in label or "nächste" in label or "next" in label:
-                        link = a
+        def extract_user_id(html: str) -> Optional[str]:
+            """Attempt to extract a seller userId from the page source.
+
+            Kleinanzeigen embeds a user identifier in several places on
+            seller pages and ad pages.  This helper searches for
+            patterns like ``userId: 12345``, ``sellerId=12345`` or
+            ``memberId": "12345"`` within JSON or markup.  Returns the
+            first ID found or ``None`` if none match.
+            """
+            patterns = [
+                r"userId[\"']?\s*[:=]\s*[\"']?(\d+)",
+                r"sellerId[\"']?\s*[:=]\s*[\"']?(\d+)",
+                r"memberId[\"']?\s*[:=]\s*[\"']?(\d+)",
+                r"\"userId\"\s*:\s*\"?(\d+)\"?",
+            ]
+            for pat in patterns:
+                m = re.search(pat, html, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+            return None
+
+        # Step 1: fetch the initial page and collect any ads present
+        base_url = seller_url
+        html = self._fetch(seller_url)
+        collect_from_html(html, base_url)
+
+        # If we didn't find any ads or we suspect only a subset was
+        # returned (profile pages often show only 25 items), try to
+        # derive the seller's userId and fetch the full inventory list.
+        # A heuristic: if fewer than 30 ads are found, attempt to use the
+        # inventory list.  Many dealers have more than 30 listings.
+        if len(ad_urls) < 30:
+            uid = extract_user_id(html)
+            if not uid:
+                # As a fallback, pick the first ad link on the page and
+                # fetch the listing to extract the userId from there.
+                first_ad = None
+                # search for any link with /s-anzeige/
+                for a in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+                    if "/s-anzeige/" in a["href"]:
+                        first_ad = urljoin(base_url, a["href"])
                         break
-            if link and link.get("href"):
-                candidate = urljoin(base, link["href"])
-                # break if we would loop forever
-                if candidate == next_url:
-                    break
-                next_url = candidate
-            else:
-                break
+                if first_ad:
+                    try:
+                        ad_html = self._fetch(first_ad, referer=seller_url)
+                        uid = extract_user_id(ad_html)
+                    except Exception:
+                        uid = None
+            if uid:
+                # Build inventory URL.  The 's-bestandsliste' endpoint
+                # returns all ads for a userId in one page (server‑rendered).
+                inventory_url = (
+                    f"https://www.kleinanzeigen.de/s-bestandsliste.html?userId={uid}"
+                )
+                try:
+                    inv_html = self._fetch(inventory_url, referer=seller_url)
+                    # Clear previously collected ads to avoid duplicates.  Use
+                    # the inventory page as the definitive source for this seller.
+                    seen.clear()
+                    ad_urls.clear()
+                    collect_from_html(inv_html, "https://www.kleinanzeigen.de")
+                except Exception:
+                    # If fetching the inventory fails, keep whatever we have
+                    pass
 
+        # Remove duplicates while preserving order (should already be unique)
         return ad_urls
 
     def scrape_listing(self, ad_url: str) -> ListingData:
@@ -212,15 +324,52 @@ class KleinanzeigenScraper:
         if not description:
             description = soup.get_text("\n", strip=True)
 
-        # Extract image URLs: look for img tags pointing to prod-ads images
+        # Extract image URLs.  We collect images from multiple sources:
+        #  1) <img> tags referencing prod-ads images.  These usually
+        #     point to a thumbnail; we strip query parameters to obtain
+        #     the base URL.  
+        #  2) JSON-LD blocks (type ImageObject) contain a ``contentUrl``
+        #     property referencing a higher-resolution image.  We
+        #     include these as well and normalise them by removing
+        #     query parameters.  
         image_urls: List[str] = []
+        # a) direct <img> tags
         for img in soup.find_all("img"):
             src = img.get("src") or ""
             if "/api/v1/prod-ads/images/" in src:
-                # remove query params to get a consistent URL
                 clean = src.split("?")[0]
                 if clean not in image_urls:
                     image_urls.append(clean)
+            # also inspect srcset entries (comma separated)
+            srcset = img.get("srcset")
+            if srcset:
+                for part in srcset.split(','):
+                    url_part = part.strip().split(' ')[0]
+                    if "/api/v1/prod-ads/images/" in url_part:
+                        clean = url_part.split("?")[0]
+                        if clean not in image_urls:
+                            image_urls.append(clean)
+        # b) JSON-LD blocks
+        for script_tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                import json
+                data = json.loads(script_tag.string or "")
+            except Exception:
+                continue
+            # data can be a dict or a list
+            def extract_from(obj):
+                if isinstance(obj, dict):
+                    if obj.get("@type") == "ImageObject" and obj.get("contentUrl"):
+                        url = obj["contentUrl"]
+                        clean = url.split("?")[0]
+                        if "/api/v1/prod-ads/images/" in clean and clean not in image_urls:
+                            image_urls.append(clean)
+                    for v in obj.values():
+                        extract_from(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        extract_from(it)
+            extract_from(data)
 
         # Parse structured fields from title and description
         data = ListingData(url=ad_url, title=title, image_urls=image_urls)
@@ -349,11 +498,15 @@ class KleinanzeigenScraper:
         ad_id_match = re.search(r"/(\d+)-", listing.url)
         ad_id = ad_id_match.group(1) if ad_id_match else "listing"
         for idx, img_url in enumerate(listing.image_urls or []):
+            # normalise file extension
             ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
             filename = f"{ad_id}_{idx+1}{ext}"
             path = os.path.join(output_dir, filename)
             try:
-                resp = requests.get(img_url, headers=HEADERS)
+                # Download via the same session used for pages so that
+                # cookies (e.g. consent tokens) are sent.  Provide the
+                # ad URL as referer to mimic browser behaviour.
+                resp = self.session.get(img_url, headers={"Referer": listing.url}, timeout=30)
                 if resp.ok:
                     with open(path, "wb") as f:
                         f.write(resp.content)
@@ -364,3 +517,4 @@ class KleinanzeigenScraper:
                 # ignore individual image download failures
                 continue
         return saved
+
